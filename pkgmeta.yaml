@@ -1,0 +1,15 @@
+package-as: RipThreat
+enable-nolib-creation: no
+
+ignore:
+    - README.md
+    - .git
+    - .gitignore
+    - .vscode
+    - pkgmeta.yaml
+
+license-output: LICENSE.txt
+
+required-dependencies:
+    - ace3
+    - libsharedmedia-3-0 

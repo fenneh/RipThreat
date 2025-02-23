@@ -1,0 +1,13 @@
+## Interface: 110007
+## Title: RipThreat
+## Notes: Helps tanks track threat loss and taunts in raid environments
+## Author: fenneh
+## Version: 1.0.0
+## SavedVariables: RipThreatDB
+## X-Curse-Project-ID: 1206772
+
+## OptionalDeps: Ace3, LibSharedMedia-3.0
+## X-Embeds: Ace3, LibSharedMedia-3.0
+
+libs\load_libs.xml
+RipThreat.lua
