@@ -5,6 +5,10 @@ local hasLSM = LSM ~= nil
 -- Constants
 local SOUND_ID = 543 -- "None Shall Pass" sound (you can change this to any game sound ID you prefer)
 local TEST_MODE = false -- Set to true to test on any mob
+local DEBUG_MODE = false -- Set to true to enable debug messages
+local HEALTH_THRESHOLD = 10 -- Health multiplier for boss detection
+local CHECK_THRESHOLD = 0.5 -- Time between checks for the same unit (in seconds)
+local ALERT_COOLDOWN = 5.0 -- Minimum time between alerts for the same unit (in seconds)
 
 -- Default settings
 local defaults = {
@@ -73,7 +77,30 @@ historyMessages:SetInsertMode("BOTTOM")
 local tankCache = {}
 local lastCheckedUnit = nil
 local lastCheckedTime = 0
-local CHECK_THRESHOLD = 0.1 -- minimum time between checks for the same unit (in seconds)
+local isInInstance = false -- Track if player is in an instance
+local isInCombat = false -- Track if player is in combat
+local bossCache = {} -- Cache boss status to avoid repeated checks
+local lastAlertTime = {} -- Track when we last alerted for each unit
+
+-- Table of all tank taunt spell IDs with their names
+local TAUNT_DEBUFFS = {
+    [355] = "Taunt",           -- Warrior
+    [56222] = "Dark Command",  -- Death Knight
+    [49576] = "Death Grip",    -- Death Knight
+    [6795] = "Growl",         -- Druid
+    [185245] = "Torment",      -- Demon Hunter
+    [116189] = "Provoke",      -- Monk
+    [62124] = "Hand of Reckoning", -- Paladin
+    [17735] = "Suffering",     -- Warlock Voidwalker
+    [20736] = "Distracting Shot", -- Hunter
+    [281854] = "Torment",      -- Warlock Felguard
+    [2649] = "Growl"         -- Hunter Pet
+}
+
+-- Cache for taunt info to avoid repeated aura scans
+local tauntCache = {}
+local tauntCacheTime = {}
+local TAUNT_CACHE_DURATION = 0.5 -- How long to cache taunt info (in seconds)
 
 -- Function to update frame position from saved variables
 local function UpdateFramePosition()
@@ -152,24 +179,18 @@ local function ShowAlertText(text, isWarning)
     end)
 end
 
--- Table of all tank taunt spell IDs with their names
-local TAUNT_DEBUFFS = {
-    [355] = "Taunt",           -- Warrior
-    [56222] = "Dark Command",  -- Death Knight
-    [49576] = "Death Grip",    -- Death Knight
-    [6795] = "Growl",         -- Druid
-    [185245] = "Torment",      -- Demon Hunter
-    [116189] = "Provoke",      -- Monk
-    [62124] = "Hand of Reckoning", -- Paladin
-    [17735] = "Suffering",     -- Warlock Voidwalker
-    [20736] = "Distracting Shot", -- Hunter
-    [281854] = "Torment",      -- Warlock Felguard
-    [2649] = "Growl"         -- Hunter Pet
-}
-
 -- Function to check if unit has any taunt debuff and return taunt info
 local function GetTauntInfo(unit)
     if not unit then return nil end
+    
+    -- Check cache first
+    local guid = UnitGUID(unit)
+    if guid then
+        local currentTime = GetTime()
+        if tauntCache[guid] and (currentTime - tauntCacheTime[guid]) < TAUNT_CACHE_DURATION then
+            return tauntCache[guid]
+        end
+    end
     
     local foundTaunt = nil
     AuraUtil.ForEachAura(unit, "HARMFUL", nil, function(name, icon, count, debuffType, duration, expirationTime, source, isStealable, nameplateShowPersonal, spellId)
@@ -222,9 +243,22 @@ local function GetTauntInfo(unit)
                 caster = coloredName,
                 ability = TAUNT_DEBUFFS[spellId]
             }
+            
+            -- Cache the result
+            if guid then
+                tauntCache[guid] = foundTaunt
+                tauntCacheTime[guid] = GetTime()
+            end
+            
             return true -- Stop iteration
         end
     end)
+    
+    -- Cache negative results too
+    if not foundTaunt and guid then
+        tauntCache[guid] = nil
+        tauntCacheTime[guid] = GetTime()
+    end
     
     return foundTaunt
 end
@@ -236,12 +270,50 @@ local function IsRaidBoss(unit)
     if not unit then return false end
     if not UnitExists(unit) then return false end
     
-    -- Check classification (raid boss) or if it's in a raid instance
+    -- Only check in instances
+    if not isInInstance then return false end
+    
+    -- Check cache first
+    local guid = UnitGUID(unit)
+    if guid and bossCache[guid] ~= nil then
+        return bossCache[guid]
+    end
+    
+    -- Check classification and instance type
     local classification = UnitClassification(unit)
     local _, instanceType = IsInInstance()
     
-    return (classification == "worldboss" or classification == "raidBoss") or
-           (instanceType == "raid" and classification == "boss")
+    -- Check if unit is a boss by various methods
+    local isBoss = false
+    
+    -- Method 1: Check unit classification
+    if classification == "worldboss" or classification == "raidBoss" or classification == "boss" then
+        isBoss = true
+    end
+    
+    -- Method 2: Check if in instance and has boss flag
+    if not isBoss and (instanceType == "raid" or instanceType == "party") and UnitLevel(unit) == -1 then
+        isBoss = true
+    end
+    
+    -- Method 3: Check unit health compared to player health (bosses have much more health)
+    -- Only do this check if the other methods failed and we're in combat
+    if not isBoss and isInCombat and classification == "elite" then
+        if UnitHealthMax(unit) > UnitHealthMax("player") * HEALTH_THRESHOLD then
+            isBoss = true
+        end
+    end
+    
+    if DEBUG_MODE then
+        print("|cFFFF0000[RipThreat Debug]|r", UnitName(unit), "isBoss:", isBoss, "classification:", classification, "instanceType:", instanceType)
+    end
+    
+    -- Cache the result if we have a GUID
+    if guid then
+        bossCache[guid] = isBoss
+    end
+    
+    return isBoss
 end
 
 -- Table of tank specializations by class ID
@@ -266,10 +338,9 @@ local TANK_SPECS = {
     },
 }
 
--- Function to check if a unit is a tank
+-- Function to check if a unit is a tank - optimized version
 local function IsUnitTank(unit)
     if not unit or not UnitExists(unit) then 
-        print("|cFFFF0000[RipThreat Debug]|r Unit doesn't exist:", unit)
         return false 
     end
     
@@ -278,7 +349,6 @@ local function IsUnitTank(unit)
     -- First check group role if in party/raid (most reliable)
     if UnitInParty(unit) or UnitInRaid(unit) then
         local role = UnitGroupRolesAssigned(unit)
-        print("|cFFFF0000[RipThreat Debug]|r Group member", name, "Role:", role)
         -- Cache the result
         tankCache[name] = (role == "TANK")
         return role == "TANK"
@@ -286,18 +356,20 @@ local function IsUnitTank(unit)
     
     -- Check cache for known tanks
     if tankCache[name] ~= nil then
-        print("|cFFFF0000[RipThreat Debug]|r Using cached tank status for", name, ":", tankCache[name])
         return tankCache[name]
+    end
+    
+    -- If not in an instance, don't bother with further checks
+    if not isInInstance then
+        return false
     end
     
     -- If not in group, check if they're even a class that can tank
     if UnitIsPlayer(unit) then
         local _, class, classID = UnitClass(unit)
-        print("|cFFFF0000[RipThreat Debug]|r Non-group player", name, "Class:", class)
         
         -- If it's not a class that can tank, cache and return false
         if not TANK_SPECS[classID] then 
-            print("|cFFFF0000[RipThreat Debug]|r Not a tank class")
             tankCache[name] = false
             return false 
         end
@@ -308,21 +380,13 @@ local function IsUnitTank(unit)
         if UnitExists(unitTarget) then
             local isTanking = UnitDetailedThreatSituation(unit, unitTarget)
             if isTanking then
-                print("|cFFFF0000[RipThreat Debug]|r", name, "is actively tanking - assuming tank spec")
                 tankCache[name] = true
                 return true
             end
         end
-        
-        -- Start an inspect request for future reference
-        if CanInspect(unit) then
-            NotifyInspect(unit)
-        end
     end
     
     -- Default to false but don't cache the result
-    -- This allows future checks to potentially succeed
-    print("|cFFFF0000[RipThreat Debug]|r Could not determine tank status for", name)
     return false
 end
 
@@ -333,13 +397,25 @@ local function HandleThreatLoss(unit)
     -- Get threat situation
     local isTanking, status = UnitDetailedThreatSituation("player", unit)
     
+    -- Get unit GUID for tracking
+    local guid = UnitGUID(unit)
+    local currentTime = GetTime()
+    
     -- If we were tanking and now we're not
     if not isTanking and RT.wasTanking then
+        -- Check if we're in alert cooldown for this unit
+        if guid and lastAlertTime[guid] and (currentTime - lastAlertTime[guid]) < ALERT_COOLDOWN then
+            if DEBUG_MODE then
+                print("|cFFFF0000[RipThreat Debug]|r Alert on cooldown for", UnitName(unit))
+            end
+            RT.wasTanking = isTanking
+            return
+        end
+        
         -- Check if the new tank is actually a tank (if tank-only alerts are enabled)
         local newTank = unit.."target"
         if RT.db.profile.tankOnlyAlerts then
             local isTank = IsUnitTank(newTank)
-            print("|cFFFF0000[RipThreat Debug]|r New tank check for", UnitName(newTank), "Result:", isTank)
             if not isTank then
                 -- Not a tank, don't alert
                 RT.wasTanking = isTanking
@@ -350,6 +426,11 @@ local function HandleThreatLoss(unit)
         -- Check if the mob has a taunt debuff
         local tauntInfo = GetTauntInfo(unit)
         local unitName = UnitName(unit)
+        
+        -- Record the alert time
+        if guid then
+            lastAlertTime[guid] = currentTime
+        end
         
         if not tauntInfo then
             -- No taunt - show alert only
@@ -663,12 +744,51 @@ end
 
 function RT:OnEnable()
     self:RegisterEvent("UNIT_THREAT_LIST_UPDATE")
-    self:RegisterEvent("INSPECT_READY")
+    self:RegisterEvent("PLAYER_ENTERING_WORLD")
+    self:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+    self:RegisterEvent("PLAYER_REGEN_DISABLED") -- Combat start
+    self:RegisterEvent("PLAYER_REGEN_ENABLED") -- Combat end
     self.wasTanking = false
+end
+
+-- New function to update instance status
+function RT:UpdateInstanceStatus()
+    local inInstance, instanceType = IsInInstance()
+    isInInstance = inInstance and (instanceType == "party" or instanceType == "raid")
+    
+    -- Clear caches when changing zones
+    tankCache = {}
+    bossCache = {}
+end
+
+function RT:PLAYER_ENTERING_WORLD()
+    self:UpdateInstanceStatus()
+end
+
+function RT:ZONE_CHANGED_NEW_AREA()
+    self:UpdateInstanceStatus()
+end
+
+function RT:PLAYER_REGEN_DISABLED()
+    isInCombat = true
+end
+
+function RT:PLAYER_REGEN_ENABLED()
+    isInCombat = false
+    -- Clear the caches when leaving combat
+    -- This helps if a mob's status changes during the fight
+    bossCache = {}
+    tauntCache = {}
+    tauntCacheTime = {}
+    lastAlertTime = {} -- Clear alert cooldowns
+    RT.wasTanking = false -- Reset tanking status
 end
 
 function RT:UNIT_THREAT_LIST_UPDATE(event, unit)
     if not unit then return end
+    
+    -- Only process if we're in an instance and in combat
+    if (not isInInstance or not isInCombat) and not TEST_MODE then return end
     
     -- Only process if unit is targeting player or is player's target
     if not (UnitIsUnit(unit.."target", "player") or UnitIsUnit("target", unit)) then
@@ -686,48 +806,26 @@ function RT:UNIT_THREAT_LIST_UPDATE(event, unit)
     -- Update cache and process threat
     lastCheckedUnit = unit
     lastCheckedTime = currentTime
-    HandleThreatLoss(unit)
-end
-
-function RT:INSPECT_READY(event, guid)
-    local unit = UnitTokenFromGUID(guid)
-    if unit then
-        local name = UnitName(unit)
-        local classID = select(3, UnitClass(unit))
-        if TANK_SPECS[classID] then
-            local specID = GetInspectSpecialization(unit)
-            if specID and TANK_SPECS[classID][specID] then
-                print("|cFFFF0000[RipThreat Debug]|r Caching", name, "as tank from inspect")
-                tankCache[name] = true
-            else
-                print("|cFFFF0000[RipThreat Debug]|r Caching", name, "as non-tank from inspect")
-                tankCache[name] = false
-            end
+    
+    -- Check if this is a valid unit to track
+    if IsRaidBoss(unit) then
+        -- Get current threat status
+        local isTanking, status, scaledPercentage, rawPercentage, threatValue = UnitDetailedThreatSituation("player", unit)
+        
+        if DEBUG_MODE then
+            print("|cFFFF0000[RipThreat Debug]|r Threat check on", UnitName(unit), 
+                  "isTanking:", isTanking or "nil", 
+                  "status:", status or "nil", 
+                  "threat %:", rawPercentage or "nil")
         end
-    end
-    ClearInspectPlayer()
-end
-
-function RT:SlashCommand(input)
-    if input == "test" then
-        TEST_MODE = not TEST_MODE
-        print("|cFFFF0000[RipThreat]|r Test mode " .. (TEST_MODE and "enabled" or "disabled"))
-        if TEST_MODE then
-            ShowAlertText("TEST - LOST THREAT - NO TAUNT!", true)
+        
+        -- Initialize wasTanking if this is the first check
+        if RT.wasTanking == nil then
+            RT.wasTanking = isTanking or false
         end
-    elseif input == "config" or input == "options" then
-        if WOW_PROJECT_ID == WOW_PROJECT_MAINLINE then
-            -- Retail WoW (Dragonflight)
-            Settings.OpenToCategory("RipThreat")
-        else
-            -- Classic WoW
-            InterfaceOptionsFrame_Show()
-            InterfaceOptionsFrame_OpenToCategory("RipThreat")
-        end
-    else
-        print("|cFFFF0000[RipThreat]|r Commands:")
-        print("  /rt test - Toggle test mode")
-        print("  /rt config - Open configuration")
+        
+        -- Process threat changes
+        HandleThreatLoss(unit)
     end
 end
 
@@ -791,5 +889,32 @@ function RT:MoveHistoryFrame()
         AddToHistory("Test Message 1", {r=1, g=0, b=0})
         AddToHistory("Test Message 2", {r=1, g=1, b=0})
         AddToHistory("Test Message 3", {r=1, g=1, b=1})
+    end
+end
+
+function RT:SlashCommand(input)
+    if input == "test" then
+        TEST_MODE = not TEST_MODE
+        print("|cFFFF0000[RipThreat]|r Test mode " .. (TEST_MODE and "enabled" or "disabled"))
+        if TEST_MODE then
+            ShowAlertText("TEST - LOST THREAT - NO TAUNT!", true)
+        end
+    elseif input == "debug" then
+        DEBUG_MODE = not DEBUG_MODE
+        print("|cFFFF0000[RipThreat]|r Debug mode " .. (DEBUG_MODE and "enabled" or "disabled"))
+    elseif input == "config" or input == "options" then
+        if WOW_PROJECT_ID == WOW_PROJECT_MAINLINE then
+            -- Retail WoW (Dragonflight)
+            Settings.OpenToCategory("RipThreat")
+        else
+            -- Classic WoW
+            InterfaceOptionsFrame_Show()
+            InterfaceOptionsFrame_OpenToCategory("RipThreat")
+        end
+    else
+        print("|cFFFF0000[RipThreat]|r Commands:")
+        print("  /rt test - Toggle test mode")
+        print("  /rt debug - Toggle debug mode")
+        print("  /rt config - Open configuration")
     end
 end
